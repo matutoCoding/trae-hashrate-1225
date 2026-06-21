@@ -56,9 +56,10 @@ const orderStatusBadgeVariant = (status: string): 'default' | 'success' | 'warni
 export default function Orders() {
   const navigate = useNavigate();
   const { user } = useAuthStore();
-  const { orders, addOrder, updateOrder, cancelOrder, getOrderById } = useOrderStore();
+  const { orders, addOrder, updateOrder, cancelOrder, getOrderById, getActiveOrders } = useOrderStore();
   const { equipment } = useEquipmentStore();
-  const { addConflict, scanConflicts, getActiveConflicts } = useConflictStore();
+  const conflicts = useConflictStore(state => state.conflicts);
+  const { scanConflicts, addConflictsForOrder } = useConflictStore();
 
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [searchText, setSearchText] = useState<string>('');
@@ -138,7 +139,8 @@ export default function Orders() {
         createdAt: new Date().toISOString()
       };
 
-      const foundConflicts = checkConflicts(testOrder, orders);
+      const activeOrders = getActiveOrders();
+      const foundConflicts = checkConflicts(testOrder, activeOrders);
       setDetectedConflicts(foundConflicts);
 
       if (foundConflicts.length > 0) {
@@ -146,7 +148,7 @@ export default function Orders() {
           formData.equipmentIds[0],
           new Date(formData.startDate),
           new Date(formData.endDate),
-          orders,
+          activeOrders,
           formData.equipmentIds
         );
         setAlternativeSlots(alternatives);
@@ -157,7 +159,7 @@ export default function Orders() {
       setDetectedConflicts([]);
       setAlternativeSlots([]);
     }
-  }, [formData.equipmentIds, formData.startDate, formData.endDate, orders]);
+  }, [formData.equipmentIds, formData.startDate, formData.endDate, orders, getActiveOrders]);
 
   const getEquipmentNames = (ids: string[]) => {
     return ids.map(id => equipment.find(e => e.id === id)?.name).filter(Boolean).join('、');
@@ -171,14 +173,14 @@ export default function Orders() {
   const handleConfirmOrder = (id: string) => {
     if (confirm('确定要确认此订单吗？')) {
       updateOrder(id, { status: 'confirmed' });
-      scanConflicts(orders);
+      scanConflicts();
     }
   };
 
   const handleCancelOrder = (id: string) => {
     if (confirm('确定要取消此订单吗？取消后将释放预订时段。')) {
       cancelOrder(id);
-      scanConflicts(orders);
+      scanConflicts();
     }
   };
 
@@ -194,12 +196,12 @@ export default function Orders() {
     }
 
     if (detectedConflicts.length > 0) {
-      if (!confirm('检测到时段冲突，确定要继续创建吗？')) {
+      if (!confirm(`检测到 ${detectedConflicts.length} 个时段冲突，确定要继续创建吗？创建后将生成冲突记录，请及时处理。`)) {
         return;
       }
     }
 
-    addOrder({
+    const newOrder = addOrder({
       customerId: user?.role === 'customer' ? user.id : formData.customerId,
       customerName: formData.customerName,
       equipmentIds: formData.equipmentIds,
@@ -213,17 +215,7 @@ export default function Orders() {
     });
 
     if (detectedConflicts.length > 0) {
-      detectedConflicts.forEach(c => {
-        addConflict({
-          orderId1: c.orderId1,
-          orderId2: c.orderId2,
-          equipmentId: c.equipmentId,
-          overlapStart: c.overlapStart,
-          overlapEnd: c.overlapEnd,
-          severity: c.severity,
-          status: 'pending'
-        });
-      });
+      addConflictsForOrder(newOrder);
     }
 
     setCreateModalOpen(false);
@@ -236,6 +228,14 @@ export default function Orders() {
       startDate: '',
       endDate: ''
     });
+
+    if (detectedConflicts.length > 0) {
+      setTimeout(() => {
+        if (confirm('订单创建成功，但存在时段冲突，是否立即前往处理？')) {
+          navigate('/conflicts');
+        }
+      }, 100);
+    }
   };
 
   const handleEquipmentSelect = (eqId: string) => {
@@ -256,8 +256,8 @@ export default function Orders() {
   };
 
   const getOrderConflicts = (orderId: string) => {
-    return getActiveConflicts().filter(
-      c => c.orderId1 === orderId || c.orderId2 === orderId
+    return conflicts.filter(
+      c => (c.orderId1 === orderId || c.orderId2 === orderId) && c.status === 'pending'
     );
   };
 
@@ -486,7 +486,10 @@ export default function Orders() {
                     <p className="text-sm text-red-600 mt-1">
                       该订单与其他订单存在 {getOrderConflicts(selectedOrder.id).length} 个设备时段冲突，请及时处理。
                     </p>
-                    <Button variant="danger" size="sm" className="mt-3">
+                    <Button variant="danger" size="sm" className="mt-3" onClick={() => {
+                      setDetailModalOpen(false);
+                      navigate('/conflicts');
+                    }}>
                       前往处理
                     </Button>
                   </div>

@@ -25,12 +25,13 @@ import { useConflictStore } from '@/store/useConflictStore';
 import { useOrderStore } from '@/store/useOrderStore';
 import { useEquipmentStore } from '@/store/useEquipmentStore';
 import { formatDate, formatDateRange, getStatusText, getStatusColor, getDaysBetween } from '@/utils/dateUtils';
+import { checkConflicts, findAlternativeSlots } from '@/utils/conflictDetector';
 import { cn } from '@/lib/utils';
 import type { Conflict, Order } from '@/types';
 
 export default function Conflicts() {
-  const { conflicts, scanConflicts, resolveConflict } = useConflictStore();
-  const { orders, cancelOrder, updateOrder, getOrderById } = useOrderStore();
+  const { conflicts, scanConflicts, resolveConflict, getConflictsForOrder } = useConflictStore();
+  const { orders, cancelOrder, updateOrder, getOrderById, getActiveOrders } = useOrderStore();
   const { getEquipmentById } = useEquipmentStore();
   
   const [selectedConflict, setSelectedConflict] = useState<Conflict | null>(null);
@@ -88,22 +89,27 @@ export default function Conflicts() {
     );
   }, [timelineOrders]);
 
+  const [adjustConflicts, setAdjustConflicts] = useState<Conflict[]>([]);
+  const [adjustAlternatives, setAdjustAlternatives] = useState<{ startDate: string; endDate: string }[]>([]);
+
   const handleScan = async () => {
     setIsScanning(true);
     await new Promise(resolve => setTimeout(resolve, 1000));
-    scanConflicts(orders);
+    scanConflicts();
     setIsScanning(false);
   };
 
   const handleViewDetail = (conflict: Conflict) => {
     setSelectedConflict(conflict);
     setIsDetailModalOpen(true);
+    setAdjustConflicts([]);
+    setAdjustAlternatives([]);
   };
 
-  const handleCancelOrder = (orderId: string, conflictId: string) => {
-    if (confirm('确定要取消此订单吗？')) {
+  const handleCancelOrder = (orderId: string) => {
+    if (confirm('确定要取消此订单吗？取消后将释放该订单占用的所有设备时段。')) {
       cancelOrder(orderId);
-      resolveConflict(conflictId);
+      scanConflicts();
       setIsDetailModalOpen(false);
     }
   };
@@ -119,20 +125,77 @@ export default function Conflicts() {
     setAdjustTarget(target);
     setNewStartDate(order.startDate);
     setNewEndDate(order.endDate);
+    setAdjustConflicts([]);
+    setAdjustAlternatives([]);
     setShowAdjustModal(true);
+  };
+
+  const checkNewTimeConflicts = (order: Order, startDate: string, endDate: string) => {
+    const testOrder: Order = {
+      ...order,
+      startDate,
+      endDate
+    };
+    const activeOrders = getActiveOrders().filter(o => o.id !== order.id);
+    const conflicts = checkConflicts(testOrder, activeOrders);
+    setAdjustConflicts(conflicts);
+
+    if (conflicts.length > 0 && order.equipmentIds.length > 0) {
+      const alternatives = findAlternativeSlots(
+        order.equipmentIds[0],
+        new Date(startDate),
+        new Date(endDate),
+        activeOrders,
+        order.equipmentIds
+      );
+      setAdjustAlternatives(alternatives);
+    } else {
+      setAdjustAlternatives([]);
+    }
   };
 
   const handleAdjustTime = () => {
     if (!selectedConflict) return;
     
     const orderId = adjustTarget === 'order1' ? selectedConflict.orderId1 : selectedConflict.orderId2;
+    const targetOrder = getOrderById(orderId);
+    if (!targetOrder) return;
+
+    const testOrder: Order = {
+      ...targetOrder,
+      startDate: newStartDate,
+      endDate: newEndDate
+    };
+    const activeOrders = getActiveOrders().filter(o => o.id !== orderId);
+    const remainingConflicts = checkConflicts(testOrder, activeOrders);
+
     updateOrder(orderId, {
       startDate: newStartDate,
       endDate: newEndDate
     });
-    resolveConflict(selectedConflict.id);
-    setShowAdjustModal(false);
-    setIsDetailModalOpen(false);
+
+    scanConflicts();
+
+    if (remainingConflicts.length === 0) {
+      alert('时段调整成功，冲突已全部解决！');
+      setShowAdjustModal(false);
+      setIsDetailModalOpen(false);
+    } else {
+      alert(`新时段仍存在 ${remainingConflicts.length} 个冲突，请重新选择时段或选择推荐的安全时段。`);
+    }
+  };
+
+  const handleSelectAlternativeSlot = (slot: { startDate: string; endDate: string }) => {
+    setNewStartDate(slot.startDate);
+    setNewEndDate(slot.endDate);
+    
+    if (selectedConflict) {
+      const orderId = adjustTarget === 'order1' ? selectedConflict.orderId1 : selectedConflict.orderId2;
+      const targetOrder = getOrderById(orderId);
+      if (targetOrder) {
+        checkNewTimeConflicts(targetOrder, slot.startDate, slot.endDate);
+      }
+    }
   };
 
   const getOrderEquipmentNames = (order: Order) => {
@@ -367,7 +430,7 @@ export default function Conflicts() {
                       variant="danger"
                       size="sm"
                       className="w-full"
-                      onClick={() => handleCancelOrder(order.id, selectedConflict.id)}
+                      onClick={() => handleCancelOrder(order.id)}
                     >
                       <XCircle className="w-4 h-4 mr-2" />
                       取消此订单
@@ -628,10 +691,11 @@ export default function Conflicts() {
         isOpen={showAdjustModal}
         onClose={() => setShowAdjustModal(false)}
         title="调整订单时段"
+        className="max-w-lg"
       >
-        <div className="p-6 space-y-4">
-          <p className="text-sm text-gray-600 mb-4">
-            请为订单选择新的时段，调整后冲突将自动标记为已解决。
+        <div className="p-6 space-y-5">
+          <p className="text-sm text-gray-600">
+            请为订单选择新的时段，系统将自动检测新时段是否仍有冲突。
           </p>
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -641,7 +705,17 @@ export default function Conflicts() {
               <input
                 type="date"
                 value={newStartDate.slice(0, 10)}
-                onChange={(e) => setNewStartDate(new Date(e.target.value).toISOString())}
+                onChange={(e) => {
+                  const val = new Date(e.target.value).toISOString();
+                  setNewStartDate(val);
+                  if (selectedConflict) {
+                    const orderId = adjustTarget === 'order1' ? selectedConflict.orderId1 : selectedConflict.orderId2;
+                    const targetOrder = getOrderById(orderId);
+                    if (targetOrder) {
+                      checkNewTimeConflicts(targetOrder, val, newEndDate);
+                    }
+                  }
+                }}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               />
             </div>
@@ -652,12 +726,92 @@ export default function Conflicts() {
               <input
                 type="date"
                 value={newEndDate.slice(0, 10)}
-                onChange={(e) => setNewEndDate(new Date(e.target.value).toISOString())}
+                onChange={(e) => {
+                  const val = new Date(e.target.value).toISOString();
+                  setNewEndDate(val);
+                  if (selectedConflict) {
+                    const orderId = adjustTarget === 'order1' ? selectedConflict.orderId1 : selectedConflict.orderId2;
+                    const targetOrder = getOrderById(orderId);
+                    if (targetOrder) {
+                      checkNewTimeConflicts(targetOrder, newStartDate, val);
+                    }
+                  }
+                }}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               />
             </div>
           </div>
-          <div className="flex justify-end gap-3 pt-4">
+
+          {adjustConflicts.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-medium text-red-800">新时段仍存在 {adjustConflicts.length} 个冲突</p>
+                  {adjustConflicts.map((c, idx) => {
+                    const eq = getEquipmentById(c.equipmentId);
+                    const currentOrderId = adjustTarget === 'order1' 
+                      ? selectedConflict?.orderId1 
+                      : selectedConflict?.orderId2;
+                    const otherOrderId = c.orderId1 === currentOrderId ? c.orderId2 : c.orderId1;
+                    const otherOrder = getOrderById(otherOrderId);
+                    return (
+                      <div key={idx} className="mt-2 text-sm text-red-700">
+                        <p>• 设备「{eq?.name}」与订单 {otherOrder?.orderNo} 冲突</p>
+                        <p className="text-xs text-red-600 ml-4">
+                          重叠时段: {formatDateRange(c.overlapStart, c.overlapEnd)}
+                        </p>
+                      </div>
+                    );
+                  })}
+                  <p className="text-sm text-red-700 mt-3">
+                    注意：保存后该冲突<strong>不会自动标记为已解决</strong>，请选择无冲突的时段。
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {adjustConflicts.length === 0 && newStartDate && newEndDate && (
+            <div className="bg-green-50 border border-green-200 rounded-xl p-4">
+              <div className="flex items-center gap-3">
+                <CheckCircle className="w-5 h-5 text-green-600" />
+                <div>
+                  <p className="font-medium text-green-800">新时段安全，无冲突</p>
+                  <p className="text-sm text-green-700">
+                    此时段内所有设备均可用，保存后冲突将自动标记为已解决。
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {adjustAlternatives.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-gray-700 flex items-center gap-2">
+              <Clock className="w-4 h-4 text-gray-500" />
+                推荐安全时段：
+              </p>
+              <div className="space-y-2">
+                {adjustAlternatives.map((slot, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => handleSelectAlternativeSlot(slot)}
+                    className="w-full p-3 bg-blue-50 border border-blue-200 rounded-lg text-left hover:bg-blue-100 transition-colors flex items-center justify-between"
+                  >
+                    <span className="text-gray-900 font-medium">
+                      {formatDateRange(slot.startDate, slot.endDate)}
+                    </span>
+                    <span className="text-xs text-green-600 bg-green-100 px-2 py-1 rounded">
+                      无冲突
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex justify-end gap-3 pt-4 border-t border-gray-100">
             <Button variant="ghost" onClick={() => setShowAdjustModal(false)}>
               取消
             </Button>

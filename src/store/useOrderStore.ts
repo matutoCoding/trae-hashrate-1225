@@ -5,11 +5,12 @@ import { mockOrders } from '@/utils/mockData';
 
 interface OrderState {
   orders: Order[];
-  addOrder: (order: Omit<Order, 'id' | 'orderNo' | 'createdAt'>) => void;
+  addOrder: (order: Omit<Order, 'id' | 'orderNo' | 'createdAt'>) => Order;
   updateOrder: (id: string, updates: Partial<Order>) => void;
   cancelOrder: (id: string) => void;
   getOrderById: (id: string) => Order | undefined;
   getOrdersByCustomer: (customerId: string) => Order[];
+  getActiveOrders: () => Order[];
 }
 
 export const useOrderStore = create<OrderState>()(
@@ -24,6 +25,7 @@ export const useOrderStore = create<OrderState>()(
           createdAt: new Date().toISOString()
         };
         set(state => ({ orders: [...state.orders, newOrder] }));
+        return newOrder;
       },
       updateOrder: (id, updates) => {
         set(state => ({
@@ -41,7 +43,9 @@ export const useOrderStore = create<OrderState>()(
       },
       getOrderById: (id) => get().orders.find(o => o.id === id),
       getOrdersByCustomer: (customerId) => 
-        get().orders.filter(o => o.customerId === customerId)
+        get().orders.filter(o => o.customerId === customerId),
+      getActiveOrders: () => 
+        get().orders.filter(o => o.status !== 'cancelled')
     }),
     {
       name: 'order-storage'

@@ -23,12 +23,12 @@ import { cn } from '@/lib/utils';
 
 export default function Dashboard() {
   const { orders } = useOrderStore();
-  const { getActiveConflicts } = useConflictStore();
+  const conflicts = useConflictStore(state => state.conflicts);
   const { getMutualMatches } = useMatchingStore();
   const { getPendingDispatches, dispatchOrders } = useDispatchStore();
   const { user } = useAuthStore();
 
-  const activeConflicts = getActiveConflicts();
+  const activeConflicts = conflicts.filter(c => c.status === 'pending');
   const mutualMatches = getMutualMatches();
   const pendingDispatches = getPendingDispatches();
 

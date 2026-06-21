@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router-dom";
 import { MainLayout } from "@/components/Layout/MainLayout";
 import Login from "@/pages/Login";
@@ -10,8 +11,15 @@ import Matching from "@/pages/Matching";
 import MatchResults from "@/pages/MatchResults";
 import Ranking from "@/pages/Ranking";
 import Dispatch from "@/pages/Dispatch";
+import { useConflictStore } from '@/store/useConflictStore';
 
 export default function App() {
+  const scanConflicts = useConflictStore(state => state.scanConflicts);
+
+  useEffect(() => {
+    scanConflicts();
+  }, [scanConflicts]);
+
   return (
     <Router>
       <Routes>

@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo, useCallback } from 'react';
+import { useState, useRef, useMemo, useCallback, useEffect } from 'react';
 import {
   format,
   startOfMonth,
@@ -37,17 +37,24 @@ import { Modal } from '@/components/ui/Modal';
 import { Input } from '@/components/ui/Input';
 import { useOrderStore } from '@/store/useOrderStore';
 import { useEquipmentStore } from '@/store/useEquipmentStore';
-import { checkConflicts } from '@/utils/conflictDetector';
-import { formatDate, getStatusText, getStatusColor, isDateInRange } from '@/utils/dateUtils';
+import { useConflictStore } from '@/store/useConflictStore';
+import { checkConflicts, findAlternativeSlots } from '@/utils/conflictDetector';
+import { formatDate, formatDateRange, getStatusText, getStatusColor, isDateInRange, getDaysBetween } from '@/utils/dateUtils';
 import { cn } from '@/lib/utils';
-import type { Order } from '@/types';
+import type { Order, Conflict } from '@/types';
+import { useNavigate } from 'react-router-dom';
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
 
 export default function Calendar() {
-  const { orders, addOrder } = useOrderStore();
+  const navigate = useNavigate();
+  const { orders, addOrder, getActiveOrders } = useOrderStore();
   const { equipment } = useEquipmentStore();
+  const { addConflictsForOrder } = useConflictStore();
+
+  const [createConflicts, setCreateConflicts] = useState<Conflict[]>([]);
+  const [createAlternatives, setCreateAlternatives] = useState<{ startDate: string; endDate: string }[]>([]);
 
   const [currentMonth, setCurrentMonth] = useState(new Date());
   const [selectedEquipmentIds, setSelectedEquipmentIds] = useState<string[]>([]);
@@ -216,13 +223,25 @@ export default function Calendar() {
       dragState.startDate &&
       dragState.endDate
     ) {
+      const startTime = `${String(dragState.startHour).padStart(2, '0')}:00`;
+      const endTime = `${String(Math.min(dragState.endHour + 1, 23)).padStart(2, '0')}:00`;
+      const equipmentIds = [...selectedEquipmentIds];
+
       setFormData(prev => ({
         ...prev,
-        startTime: `${String(dragState.startHour).padStart(2, '0')}:00`,
-        endTime: `${String(Math.min(dragState.endHour + 1, 23)).padStart(2, '0')}:00`,
-        equipmentIds: [...selectedEquipmentIds],
+        startTime,
+        endTime,
+        equipmentIds,
       }));
       setIsCreateModalOpen(true);
+
+      if (equipmentIds.length > 0 && dragState.startDate && dragState.endDate) {
+        const [startHour, startMin] = startTime.split(':').map(Number);
+        const [endHour, endMin] = endTime.split(':').map(Number);
+        const startDate = setMinutes(setHours(dragState.startDate, startHour), startMin).toISOString();
+        const endDate = setMinutes(setHours(dragState.endDate, endHour), endMin).toISOString();
+        setTimeout(() => checkCreateConflicts(equipmentIds, startDate, endDate), 0);
+      }
     }
     setDragState({
       isDragging: false,
@@ -255,6 +274,61 @@ export default function Calendar() {
     return currentDateTime >= startDateTime && nextHour <= endDateTime;
   };
 
+  const checkCreateConflicts = (equipmentIds: string[], startDate: string, endDate: string) => {
+    if (equipmentIds.length === 0 || !startDate || !endDate) {
+      setCreateConflicts([]);
+      setCreateAlternatives([]);
+      return;
+    }
+
+    const testOrder: Order = {
+      id: 'temp-calendar',
+      orderNo: 'TEMP',
+      customerId: '',
+      customerName: '',
+      equipmentIds,
+      startDate,
+      endDate,
+      status: 'pending',
+      totalAmount: 0,
+      createdAt: ''
+    };
+
+    const activeOrders = getActiveOrders();
+    const conflicts = checkConflicts(testOrder, activeOrders);
+    setCreateConflicts(conflicts);
+
+    if (conflicts.length > 0 && equipmentIds.length > 0) {
+      const alternatives = findAlternativeSlots(
+        equipmentIds[0],
+        new Date(startDate),
+        new Date(endDate),
+        activeOrders,
+        equipmentIds
+      );
+      setCreateAlternatives(alternatives);
+    } else {
+      setCreateAlternatives([]);
+    }
+  };
+
+  const handleSelectAlternativeSlot = (slot: { startDate: string; endDate: string }) => {
+    const start = new Date(slot.startDate);
+    const end = new Date(slot.endDate);
+    const [startHour] = formData.startTime.split(':').map(Number);
+    const [endHour] = formData.endTime.split(':').map(Number);
+
+    setDragState(prev => ({
+      ...prev,
+      startDate: start,
+      endDate: end
+    }));
+
+    const newStart = setHours(start, startHour).toISOString();
+    const newEnd = setHours(end, endHour).toISOString();
+    checkCreateConflicts(formData.equipmentIds, newStart, newEnd);
+  };
+
   const handleCreateOrder = () => {
     if (
       !dragState.startDate ||
@@ -275,13 +349,34 @@ export default function Calendar() {
       endMin
     ).toISOString();
 
+    const testOrder: Order = {
+      id: 'temp-create',
+      orderNo: 'TEMP',
+      customerId: '',
+      customerName: '',
+      equipmentIds: formData.equipmentIds,
+      startDate,
+      endDate,
+      status: 'pending',
+      totalAmount: 0,
+      createdAt: ''
+    };
+    const activeOrders = getActiveOrders();
+    const conflicts = checkConflicts(testOrder, activeOrders);
+
+    if (conflicts.length > 0) {
+      if (!confirm(`检测到 ${conflicts.length} 个时段冲突，确定要继续创建吗？创建后将生成冲突记录，请及时处理。`)) {
+        return;
+      }
+    }
+
     const days = differenceInDays(dragState.endDate, dragState.startDate) + 1;
     const totalAmount = formData.equipmentIds.reduce((sum, eqId) => {
       const eq = equipment.find(e => e.id === eqId);
       return sum + (eq ? eq.dailyRate * days : 0);
     }, 0);
 
-    const newOrder = {
+    const newOrderData = {
       customerId: formData.customerId || `customer-${Date.now()}`,
       customerName: formData.customerName,
       equipmentIds: formData.equipmentIds,
@@ -291,9 +386,15 @@ export default function Calendar() {
       totalAmount,
       eventName: formData.eventName,
       address: formData.address,
+      conflictFlag: conflicts.length > 0
     };
 
-    addOrder(newOrder);
+    const newOrder = addOrder(newOrderData);
+
+    if (conflicts.length > 0) {
+      addConflictsForOrder(newOrder);
+    }
+
     setIsCreateModalOpen(false);
     setFormData({
       customerName: '',
@@ -304,6 +405,16 @@ export default function Calendar() {
       startTime: '09:00',
       endTime: '18:00',
     });
+    setCreateConflicts([]);
+    setCreateAlternatives([]);
+
+    if (conflicts.length > 0) {
+      setTimeout(() => {
+        if (confirm('订单创建成功，但存在时段冲突，是否立即前往处理？')) {
+          navigate('/conflicts');
+        }
+      }, 100);
+    }
   };
 
   const toggleEquipmentFilter = (eqId: string) => {
@@ -313,12 +424,24 @@ export default function Calendar() {
   };
 
   const toggleEquipmentSelection = (eqId: string) => {
-    setFormData(prev => ({
-      ...prev,
-      equipmentIds: prev.equipmentIds.includes(eqId)
+    setFormData(prev => {
+      const newEquipmentIds = prev.equipmentIds.includes(eqId)
         ? prev.equipmentIds.filter(id => id !== eqId)
-        : [...prev.equipmentIds, eqId],
-    }));
+        : [...prev.equipmentIds, eqId];
+
+      if (dragState.startDate && dragState.endDate) {
+        const [startHour, startMin] = prev.startTime.split(':').map(Number);
+        const [endHour, endMin] = prev.endTime.split(':').map(Number);
+        const startDate = setMinutes(setHours(dragState.startDate, startHour), startMin).toISOString();
+        const endDate = setMinutes(setHours(dragState.endDate, endHour), endMin).toISOString();
+        setTimeout(() => checkCreateConflicts(newEquipmentIds, startDate, endDate), 0);
+      }
+
+      return {
+        ...prev,
+        equipmentIds: newEquipmentIds,
+      };
+    });
   };
 
   return (
@@ -729,17 +852,33 @@ export default function Calendar() {
               label="开始时间"
               type="time"
               value={formData.startTime}
-              onChange={e =>
-                setFormData({ ...formData, startTime: e.target.value })
-              }
+              onChange={e => {
+                const newTime = e.target.value;
+                setFormData({ ...formData, startTime: newTime });
+                if (formData.equipmentIds.length > 0 && dragState.startDate && dragState.endDate) {
+                  const [startHour, startMin] = newTime.split(':').map(Number);
+                  const [endHour, endMin] = formData.endTime.split(':').map(Number);
+                  const startDate = setMinutes(setHours(dragState.startDate, startHour), startMin).toISOString();
+                  const endDate = setMinutes(setHours(dragState.endDate, endHour), endMin).toISOString();
+                  checkCreateConflicts(formData.equipmentIds, startDate, endDate);
+                }
+              }}
             />
             <Input
               label="结束时间"
               type="time"
               value={formData.endTime}
-              onChange={e =>
-                setFormData({ ...formData, endTime: e.target.value })
-              }
+              onChange={e => {
+                const newTime = e.target.value;
+                setFormData({ ...formData, endTime: newTime });
+                if (formData.equipmentIds.length > 0 && dragState.startDate && dragState.endDate) {
+                  const [startHour, startMin] = formData.startTime.split(':').map(Number);
+                  const [endHour, endMin] = newTime.split(':').map(Number);
+                  const startDate = setMinutes(setHours(dragState.startDate, startHour), startMin).toISOString();
+                  const endDate = setMinutes(setHours(dragState.endDate, endHour), endMin).toISOString();
+                  checkCreateConflicts(formData.equipmentIds, startDate, endDate);
+                }
+              }}
             />
           </div>
 
@@ -791,6 +930,75 @@ export default function Calendar() {
               ))}
             </div>
           </div>
+
+          {createConflicts.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-medium text-red-800">
+                    检测到 {createConflicts.length} 个时段冲突
+                  </p>
+                  {createConflicts.map((c, idx) => {
+                    const eq = equipment.find(e => e.id === c.equipmentId);
+                    const otherOrder = getActiveOrders().find(o => o.id !== 'temp-calendar' && (o.id === c.orderId1 || o.id === c.orderId2));
+                    return (
+                      <div key={idx} className="mt-2 text-sm text-red-700">
+                        <p>• 设备「{eq?.name}」与订单 {otherOrder?.orderNo} 冲突</p>
+                        <p className="text-xs text-red-600 ml-4">
+                          重叠时段: {formatDateRange(c.overlapStart, c.overlapEnd)}
+                        </p>
+                      </div>
+                    );
+                  })}
+                  <p className="text-sm text-red-700 mt-3">
+                    注意：此时段的设备已被占用，创建后将生成冲突记录。
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {createConflicts.length === 0 && formData.equipmentIds.length > 0 && dragState.startDate && dragState.endDate && (
+            <div className="bg-green-50 border border-green-200 rounded-xl p-4">
+              <div className="flex items-center gap-3">
+                <svg className="w-5 h-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+                </svg>
+                <div>
+                  <p className="font-medium text-green-800">此时段安全可用</p>
+                  <p className="text-sm text-green-700">
+                    所选设备在该时段均可用，可以正常创建订单。
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {createAlternatives.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-gray-700 flex items-center gap-2">
+                <Clock className="w-4 h-4 text-gray-500" />
+                推荐安全时段：
+              </p>
+              <div className="space-y-2">
+                {createAlternatives.map((slot, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => handleSelectAlternativeSlot(slot)}
+                    className="w-full p-3 bg-blue-50 border border-blue-200 rounded-lg text-left hover:bg-blue-100 transition-colors flex items-center justify-between"
+                  >
+                    <span className="text-gray-900 font-medium">
+                      {formatDateRange(slot.startDate, slot.endDate)}
+                    </span>
+                    <span className="text-xs text-green-600 bg-green-100 px-2 py-1 rounded">
+                      无冲突
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {formData.equipmentIds.length > 0 &&
             dragState.startDate &&
